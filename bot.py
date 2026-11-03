@@ -5,6 +5,7 @@ import time
 import asyncio
 import logging
 import urllib.request
+import urllib.error
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -23,17 +24,26 @@ logging.getLogger("telegram").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 START_BALANCE = 50.0
-CACHE_SECONDS = 60
+CACHE_SECONDS = 300
+RETRY_SECONDS = 300
 
 COINS = {
     "bitcoin": "BTC",
     "ethereum": "ETH",
     "solana": "SOL",
+    "binancecoin": "BNB",
+    "ripple": "XRP",
+    "chainlink": "LINK",
+    "avalanche-2": "AVAX",
+    "sui": "SUI",
+    "dogecoin": "DOGE",
+    "cardano": "ADA",
 }
 
 price_cache = {
     "prices": None,
     "timestamp": 0,
+    "retry_after": 0,
 }
 price_lock = asyncio.Lock()
 
@@ -49,15 +59,16 @@ def menu():
 
 
 def fetch_prices():
+    ids = ",".join(COINS.keys())
     url = (
         "https://api.coingecko.com/api/v3/simple/price"
-        "?ids=bitcoin,ethereum,solana&vs_currencies=usd"
+        f"?ids={ids}&vs_currencies=usd"
     )
 
     request = urllib.request.Request(
         url,
         headers={
-            "User-Agent": "CryptoPaperBot/0.2.1",
+            "User-Agent": "CryptoPaperBot/0.3",
             "Accept": "application/json",
         },
     )
@@ -66,13 +77,10 @@ def fetch_prices():
         data = json.load(response)
 
     prices = {}
-
     for coin_id, symbol in COINS.items():
         price = data.get(coin_id, {}).get("usd")
-
         if not isinstance(price, (int, float)) or price <= 0:
             raise ValueError(f"Некорректная цена {symbol}")
-
         prices[symbol] = price
 
     return prices
@@ -87,20 +95,34 @@ async def get_prices():
         if cached is not None and age < CACHE_SECONDS:
             return cached, age, False
 
+        if now < price_cache["retry_after"]:
+            if cached is not None:
+                return cached, age, True
+            raise RuntimeError("API cooldown")
+
         try:
             prices = await asyncio.to_thread(fetch_prices)
             price_cache["prices"] = prices
             price_cache["timestamp"] = time.time()
+            price_cache["retry_after"] = 0
             return prices, 0, False
 
-        except Exception:
-            logger.exception("CoinGecko request failed")
+        except urllib.error.HTTPError as exc:
+            logger.warning("CoinGecko HTTP status: %s", exc.code)
+            price_cache["retry_after"] = time.time() + RETRY_SECONDS
 
-            if cached is not None:
-                age = time.time() - price_cache["timestamp"]
-                return cached, age, True
+        except Exception as exc:
+            logger.warning(
+                "CoinGecko error: %s", type(exc).__name__
+            )
+            price_cache["retry_after"] = time.time() + 60
 
-            raise
+        cached = price_cache["prices"]
+        if cached is not None:
+            age = time.time() - price_cache["timestamp"]
+            return cached, age, True
+
+        raise RuntimeError("Котировки недоступны")
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -108,10 +130,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.setdefault("trades", [])
 
     await update.message.reply_text(
-        "🤖 AI Crypto Trader v0.2.1\n\n"
+        "🤖 AI Crypto Trader v0.3\n\n"
         "Режим: Paper Trading\n"
-        "Стартовый капитал: $50\n"
-        "Планируемая биржа: Bybit Spot\n\n"
+        "Капитал: $50\n"
+        "Биржа для будущих сделок: Bybit Spot\n"
+        "Монет под наблюдением: 10\n\n"
         "Выбери действие:",
         reply_markup=menu(),
     )
@@ -130,30 +153,24 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
             prices, age, stale = await get_prices()
 
             message = "💹 Котировки CoinGecko\n\n"
-
             for symbol, price in prices.items():
-                message += f"{symbol}: ${price:,.2f}\n"
+                message += f"{symbol}: ${price:,.4f}\n"
+
+            message += f"\n🕒 Возраст данных: {age:.0f} сек."
 
             if stale:
-                message += (
-                    "\n⚠️ API временно недоступен.\n"
-                    f"Последние сохранённые цены: {age:.0f} сек. назад."
-                )
+                message += "\n⚠️ API недоступен. Цены устарели."
             else:
-                message += (
-                    f"\n🕒 Возраст данных в кеше: {age:.0f} сек.\n"
-                    "Котировки могут поступать с задержкой."
-                )
+                message += "\nКотировки могут поступать с задержкой."
 
         except Exception:
             message = (
-                "⚠️ Не удалось получить котировки.\n"
-                "Сохранённых цен пока нет.\n"
-                "Попробуй через минуту."
+                "⚠️ Котировки пока недоступны.\n"
+                "Повтори попытку через несколько минут."
             )
 
     elif data == "balance":
-        message = f"💰 Свободный виртуальный баланс: ${balance:.2f}"
+        message = f"💰 Виртуальный баланс: ${balance:.2f}"
 
     elif data == "settings":
         message = (
@@ -163,8 +180,8 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Горизонт: 2–14 дней\n"
             "Риск: высокий\n"
             "Подтверждение: вручную\n"
-            "Источник: CoinGecko\n"
-            "Кеш котировок: 60 секунд"
+            "Монет: 10\n"
+            "Кеш: 5 минут"
         )
 
     elif data == "signal":
@@ -183,7 +200,7 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "🧪 ДЕМО-СИГНАЛ\n\n"
             "BTC/USDT\n"
             "Сумма: $5\n\n"
-            "Это учебная операция, не торговая рекомендация.",
+            "Это учебный пример, а не результат анализа.",
             reply_markup=keyboard,
         )
         return
@@ -207,12 +224,9 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data == "trades":
         if trades:
-            message = "📋 Виртуальные позиции:\n\n"
-
+            message = "📋 Учебные позиции:\n\n"
             for trade in trades:
-                message += (
-                    f"{trade['pair']} — ${trade['amount']}\n"
-                )
+                message += f"{trade['pair']} — ${trade['amount']}\n"
         else:
             message = "Открытых виртуальных позиций нет."
 
@@ -227,16 +241,12 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
-
     if not token:
         raise RuntimeError("TELEGRAM_BOT_TOKEN не задан")
 
     app = ApplicationBuilder().token(token).build()
-
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(buttons))
-
-    logger.info("Crypto bot starting")
     app.run_polling()
 
 
